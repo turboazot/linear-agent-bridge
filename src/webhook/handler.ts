@@ -626,7 +626,7 @@ async function createSessionForDelegatedIssue(
 
   const result = await callLinear(api, cfg, "agentSessionCreateOnIssue(delegate)", {
     query: AGENT_SESSION_CREATE_ON_ISSUE_MUTATION,
-    variables: { issueId },
+    variables: { input: { issueId } },
   });
   if (!result.ok) return { sessionId: "", reason: "agentSessionCreateOnIssue-failed" };
   const root = readObject(result.data?.agentSessionCreateOnIssue);
