@@ -16,6 +16,7 @@ import {
   SESSION_UPDATE_MUTATION,
   AGENT_SESSION_CREATE_ON_ISSUE_MUTATION,
 } from "../graphql/mutations.js";
+import { ISSUE_DETAIL_QUERY } from "../graphql/queries.js";
 import {
   readBody,
   readHeader,
@@ -28,6 +29,7 @@ import { verifySignature } from "./validation.js";
 import {
   resolveSessionId,
   resolveSessionIdWithFallback,
+  resolveKnownSessionForIssue,
   resolveIssue,
   rememberSessionHint,
 } from "./session-resolver.js";
@@ -65,6 +67,8 @@ const AGENT_TIMEOUT_MS = 30 * 60 * 1000;
 // Maps session ID → timestamp when marked inflight.
 const inflightSessions = new Map<string, number>();
 const DEDUP_WINDOW_MS = 5_000;
+const delegationByIssue = new Map<string, { sessionId: string; at: number }>();
+const initializedSessions = new Set<string>();
 
 export function createLinearWebhook(
   api: OpenClawPluginApi,
@@ -150,8 +154,6 @@ async function handleWebhook(
   if (kind === "Comment" && (await isSelfAuthoredComment(api, cfg, data))) {
     return;
   }
-  const isIssueDelegatedUpdate =
-    kind === "Issue" && (!rawAction || rawAction === "update" || rawAction === "updated");
   const isIssueAssignedNotification =
     kind === "AppUserNotification" &&
     (notificationType === "issueassignedtoyou" ||
@@ -160,11 +162,38 @@ async function handleWebhook(
     kind === "Comment" &&
     (!rawAction || rawAction === "create" || rawAction === "created" || rawAction === "prompted");
 
+  if (kind === "AppUserNotification") {
+    const notification = readObject(data.notification);
+    const payload = readObject(data.payload);
+    const entity = readObject(data.entity);
+    const subject = readObject(data.subject);
+    const organization = readObject(data.organization);
+    const candidates = [
+      readString(readObject(notification?.issue)?.id),
+      readString(readObject(payload?.issue)?.id),
+      readString(readObject(entity?.issue)?.id),
+      readString(readObject(subject?.issue)?.id),
+      readString(readObject(organization?.issue)?.id),
+      readString(notification?.issueId),
+      readString(payload?.issueId),
+      readString(entity?.issueId),
+      readString(subject?.issueId),
+      readString(organization?.issueId),
+      readString(data.issueId as string),
+      readString(readObject(resolveIssue(data))?.id),
+    ].filter(Boolean);
+    const topKeys = Object.keys(data).join(",");
+    const notificationKeys = notification ? Object.keys(notification).join(",") : "";
+    api.logger.info?.(
+      `linear app-notification action=${rawAction || "-"} notificationType=${notificationType || "-"} candidates=${candidates.length ? candidates.join("|") : "(none)"} keys=[${topKeys}] notificationKeys=[${notificationKeys}]`,
+    );
+  }
+
   // Strict trigger allowlist:
-  // 1) issue delegated to app
+  // 1) issue delegated to app (notification event)
   // 2) comment created
   // 3) thread comment created (covered by Comment + parentId handling later)
-  if (!isIssueDelegatedUpdate && !isIssueAssignedNotification && !isCommentCreated) {
+  if (!isIssueAssignedNotification && !isCommentCreated) {
     if (kind === "AppUserNotification") {
       logEvent(api, "notification", data);
     } else if (kind) {
@@ -176,8 +205,9 @@ async function handleWebhook(
   let sessionId = await resolveSessionIdWithFallback(api, cfg, data);
   let delegationSessionCreated = false;
   let delegationReason = "";
-  if (!sessionId && (isIssueDelegatedUpdate || isIssueAssignedNotification)) {
-    const requireDelegateChange = isIssueDelegatedUpdate;
+  let delegationIssueId = "";
+  if (!sessionId && isIssueAssignedNotification) {
+    const requireDelegateChange = false;
     const delegated = await createSessionForDelegatedIssue(
       api,
       cfg,
@@ -187,6 +217,7 @@ async function handleWebhook(
     if (delegated.sessionId) {
       sessionId = delegated.sessionId;
       delegationSessionCreated = true;
+      delegationIssueId = delegated.issueId;
     } else {
       delegationReason = delegated.reason;
       api.logger.info?.(
@@ -203,11 +234,6 @@ async function handleWebhook(
         api.logger.info?.(
           `linear webhook ignored (${kind}) keys=[${topKeys}] dataKeys=[${nestedKeys}]`,
         );
-      } else if (kind === "Issue") {
-        const action = readString(data.action as string) ?? "";
-        api.logger.info?.(
-          `linear webhook ignored (Issue) action=${action || "unknown"} reason=${delegationReason || "no-session"}`,
-        );
       } else {
         api.logger.info?.(`linear webhook ignored (${kind})`);
       }
@@ -217,10 +243,20 @@ async function handleWebhook(
   const eventData: Record<string, unknown> = resolveSessionId(data)
     ? { ...data }
     : { ...data, agentSessionId: sessionId };
+  if (delegationIssueId && !readString(eventData.issueId as string) && !readObject(eventData.issue)) {
+    eventData.issueId = delegationIssueId;
+  }
   if (delegationSessionCreated) {
     eventData.__delegationSessionCreated = true;
   }
   rememberSessionHint(eventData, sessionId);
+  const eventIssueId =
+    readString(resolveIssue(eventData)?.id) ??
+    readString(eventData.issueId as string) ??
+    "";
+  if (eventIssueId && sessionId) {
+    delegationByIssue.set(eventIssueId, { sessionId, at: Date.now() });
+  }
   await handleAgentEvent(api, cfg, eventData, delivery);
 }
 
@@ -240,11 +276,15 @@ async function handleAgentEvent(
   }
   const kind = readString(data.type as string) ?? "";
   const issue = resolveIssue(data);
-  const issueId = readString(issue?.id) ?? "";
-  const id = readString(issue?.identifier) ?? "";
-  const title = readString(issue?.title) ?? "";
-  const url = readString(issue?.url) ?? "";
-  const desc = readString(issue?.description) ?? "";
+  let issueId = readString(issue?.id) ?? "";
+  let id = readString(issue?.identifier) ?? "";
+  let title = readString(issue?.title) ?? "";
+  let url = readString(issue?.url) ?? "";
+  let desc = readString(issue?.description) ?? "";
+  let issueTeamObj = readObject(issue?.team);
+  let teamId = readString(issueTeamObj?.id) ?? "";
+  let team = resolveKey(issue?.team);
+  let proj = resolveKey(issue?.project);
   const guidance = readString(data.guidance as string) ?? "";
   const prompt = resolvePrompt(data);
   if (action === "prompted") {
@@ -274,13 +314,28 @@ async function handleAgentEvent(
   }
 
   const context = resolveContext(data);
-  const compactMessage = action === "prompted";
-  const team = resolveKey(issue?.team);
-  const proj = resolveKey(issue?.project);
+  const session = resolveSessionId(data);
+  const isFirstInSession = session ? !initializedSessions.has(session) : false;
+  const compactMessage = session ? !isFirstInSession : action === "prompted";
+  if (
+    isFirstInSession &&
+    issueId &&
+    (!id || !title || !url || !desc || !teamId)
+  ) {
+    const detail = await fetchIssueDetail(api, cfg, issueId);
+    if (detail) {
+      id ||= detail.identifier;
+      title ||= detail.title;
+      url ||= detail.url;
+      desc ||= detail.description;
+      teamId ||= detail.teamId;
+      team ||= detail.teamKey || detail.teamId;
+      proj ||= detail.projectKey || detail.projectId;
+    }
+  }
   const repo = resolveRepo(cfg, team, proj);
   const agent = cfg.devAgentId ?? "dev";
   const label = buildLabel(id, title);
-  const session = resolveSessionId(data);
 
   // Dedup: skip if an agent is already running for this session.
   // "prompted" (follow-up comment) actions are allowed through UNLESS
@@ -295,6 +350,7 @@ async function handleAgentEvent(
   }
   // Mark in-flight immediately (before any await) to prevent races.
   if (session) inflightSessions.set(session, Date.now());
+  if (session) initializedSessions.add(session);
 
   const key = normalizeKey(session || id || randomUUID());
   const sessionKey = `agent:${agent}:linear:${key}`;
@@ -332,10 +388,6 @@ async function handleAgentEvent(
     }
     applyIssuePolicy(api, cfg, issueId).catch(() => {});
   }
-
-  // Resolve team ID for context
-  const issueTeamObj = readObject(issue?.team);
-  const teamId = readString(issueTeamObj?.id) ?? "";
 
   // Generate per-session API token for agent to call back
   const enableApi = cfg.enableAgentApi !== false;
@@ -487,6 +539,42 @@ async function handleAgentEvent(
   }
 }
 
+async function fetchIssueDetail(
+  api: OpenClawPluginApi,
+  cfg: PluginConfig,
+  issueId: string,
+): Promise<{
+  identifier: string;
+  title: string;
+  url: string;
+  description: string;
+  teamId: string;
+  teamKey: string;
+  projectId: string;
+  projectKey: string;
+} | null> {
+  if (!issueId) return null;
+  const result = await callLinear(api, cfg, "issue(detail)", {
+    query: ISSUE_DETAIL_QUERY,
+    variables: { id: issueId },
+  });
+  if (!result.ok) return null;
+  const issue = readObject(result.data?.issue);
+  if (!issue) return null;
+  const team = readObject(issue.team);
+  const project = readObject(issue.project);
+  return {
+    identifier: readString(issue.identifier) ?? "",
+    title: readString(issue.title) ?? "",
+    url: readString(issue.url) ?? "",
+    description: readString(issue.description) ?? "",
+    teamId: readString(team?.id) ?? "",
+    teamKey: readString(team?.key) ?? "",
+    projectId: readString(project?.id) ?? "",
+    projectKey: readString(project?.key) ?? "",
+  };
+}
+
 export async function postActivity(
   api: OpenClawPluginApi,
   cfg: PluginConfig,
@@ -611,7 +699,7 @@ async function createSessionForDelegatedIssue(
   cfg: PluginConfig,
   data: Record<string, unknown>,
   requireDelegateChange: boolean,
-): Promise<{ sessionId: string; reason: string }> {
+): Promise<{ sessionId: string; issueId: string; reason: string }> {
   const kind = readString(data.type as string) ?? "";
   const notificationType = (
     readString(data.notificationType as string) ??
@@ -626,34 +714,79 @@ async function createSessionForDelegatedIssue(
     (notificationType === "issueassignedtoyou" ||
       notificationType === "issue_assigned_to_you");
   if (!isIssueUpdate && !isIssueAssignedNotification) {
-    return { sessionId: "", reason: `unsupported-kind:${kind || "unknown"}` };
+    return { sessionId: "", issueId: "", reason: `unsupported-kind:${kind || "unknown"}` };
   }
   if (isIssueUpdate) {
     const rawAction = (readString(data.action as string) ?? "").trim().toLowerCase();
     if (rawAction && rawAction !== "update" && rawAction !== "updated") {
-      return { sessionId: "", reason: `unsupported-action:${rawAction}` };
+      return { sessionId: "", issueId: "", reason: `unsupported-action:${rawAction}` };
     }
   }
 
   const issue = resolveIssue(data);
+  const notification = readObject(data.notification);
+  const payload = readObject(data.payload);
+  const entity = readObject(data.entity);
+  const subject = readObject(data.subject);
+  const organization = readObject(data.organization);
+  const orgIssue = readObject(organization?.issue);
+  const notificationIssue = readObject(notification?.issue);
+  const payloadIssue = readObject(payload?.issue);
+  const entityIssue = readObject(entity?.issue);
+  const subjectIssue = readObject(subject?.issue);
   const issueId =
     readString(issue?.id) ??
+    readString(notificationIssue?.id) ??
+    readString(payloadIssue?.id) ??
+    readString(entityIssue?.id) ??
+    readString(subjectIssue?.id) ??
+    readString(orgIssue?.id) ??
+    readString(notification?.issueId) ??
+    readString(payload?.issueId) ??
+    readString(entity?.issueId) ??
+    readString(subject?.issueId) ??
+    readString(organization?.issueId) ??
     readString(data.issueId as string) ??
     readString(data.id as string) ??
     "";
-  if (!issueId) return { sessionId: "", reason: "missing-issue-id" };
+  if (!issueId) {
+    const topKeys = Object.keys(data).join(",");
+    const notificationKeys = notification ? Object.keys(notification).join(",") : "";
+    api.logger.info?.(
+      `linear delegation issue id missing kind=${kind || "unknown"} notificationType=${notificationType || "-"} keys=[${topKeys}] notificationKeys=[${notificationKeys}]`,
+    );
+    return { sessionId: "", issueId: "", reason: "missing-issue-id" };
+  }
+
+  const recent = delegationByIssue.get(issueId);
+  if (recent?.sessionId) {
+    return {
+      sessionId: recent.sessionId,
+      issueId,
+      reason: "existing-issue-session-cache",
+    };
+  }
+  const existingSession = await resolveKnownSessionForIssue(api, cfg, issueId);
+  if (existingSession) {
+    delegationByIssue.set(issueId, { sessionId: existingSession, at: Date.now() });
+    return {
+      sessionId: existingSession,
+      issueId,
+      reason: "existing-issue-session-linear",
+    };
+  }
 
   const viewerId = await resolveViewer(api, cfg);
   const targetHandle = normalizeMentionHandle(cfg.mentionHandle);
   if (!viewerId && !targetHandle) {
-    return { sessionId: "", reason: "missing-viewer-and-mentionHandle" };
+    return { sessionId: "", issueId, reason: "missing-viewer-and-mentionHandle" };
   }
   if (
     requireDelegateChange &&
     !isIssueAssignedNotification &&
     !didDelegateChangeToTarget(data, viewerId, targetHandle)
   ) {
-    return { sessionId: "", reason: "delegate-change-not-targeted" };
+    return { sessionId: "", issueId, reason: "delegate-change-not-targeted" };
   }
 
   const delegate = readObject(issue?.delegate);
@@ -670,6 +803,7 @@ async function createSessionForDelegatedIssue(
   if (!isDelegatedToTarget(delegateId, delegateName, viewerId, cfg.mentionHandle)) {
     return {
       sessionId: "",
+      issueId,
       reason: `delegate-not-target id=${delegateId || "-"} name=${delegateName || "-"}`,
     };
   }
@@ -678,18 +812,20 @@ async function createSessionForDelegatedIssue(
     query: AGENT_SESSION_CREATE_ON_ISSUE_MUTATION,
     variables: { input: { issueId } },
   });
-  if (!result.ok) return { sessionId: "", reason: "agentSessionCreateOnIssue-failed" };
+  if (!result.ok) return { sessionId: "", issueId, reason: "agentSessionCreateOnIssue-failed" };
   const root = readObject(result.data?.agentSessionCreateOnIssue);
-  if (!root || root.success !== true) return { sessionId: "", reason: "agentSessionCreateOnIssue-unsuccessful" };
+  if (!root || root.success !== true) return { sessionId: "", issueId, reason: "agentSessionCreateOnIssue-unsuccessful" };
   const session = readObject(root.agentSession);
   const sessionId = readString(session?.id) ?? "";
   if (sessionId) {
+    delegationByIssue.set(issueId, { sessionId, at: Date.now() });
     api.logger.info?.(
       `linear handler: created session from delegation issue=${issueId.slice(0, 8)} session=${sessionId.slice(0, 8)}`,
     );
   }
   return {
     sessionId,
+    issueId,
     reason: sessionId ? "ok" : "missing-session-id",
   };
 }

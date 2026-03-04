@@ -72,9 +72,6 @@ export async function resolveSessionIdWithFallback(
     readString(data.issueId as string) ??
     readString(comment?.issueId as string) ??
     "";
-  if (issueId && sessionByIssueRef[issueId]) {
-    return sessionByIssueRef[issueId];
-  }
   const commentId =
     readString(comment?.id) ?? readString(data.id as string) ?? "";
   if (commentId && sessionByCommentRef[commentId]) {
@@ -105,9 +102,25 @@ export async function resolveSessionIdWithFallback(
     rememberSessionHint({ ...data, parentId }, viaComment);
     return viaComment;
   }
+  if (issueId && sessionByIssueRef[issueId]) {
+    return sessionByIssueRef[issueId];
+  }
   if (!issueId) return "";
   const viaIssue = await resolveSessionFromIssue(api, cfg, issueId);
   if (viaIssue) rememberSessionHint(data, viaIssue);
+  return viaIssue;
+}
+
+export async function resolveKnownSessionForIssue(
+  api: OpenClawPluginApi,
+  cfg: PluginConfig,
+  issueId: string,
+): Promise<string> {
+  if (!issueId) return "";
+  if (sessionByIssueRef[issueId]) return sessionByIssueRef[issueId];
+  const viaIssue = await resolveSessionFromIssue(api, cfg, issueId);
+  if (!viaIssue) return "";
+  sessionByIssueRef[issueId] = viaIssue;
   return viaIssue;
 }
 
