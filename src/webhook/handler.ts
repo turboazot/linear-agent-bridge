@@ -518,6 +518,9 @@ async function isExplicitlyAddressed(input: {
 
   // Session creation events are allowed only when delegated to this app user.
   if (action === "created") {
+    if (data.__delegationSessionCreated === true) {
+      return { ok: true, reason: "delegation-session-created" };
+    }
     const issue = resolveIssue(data);
     const issueId = readString(issue?.id) ?? readString(data.issueId as string) ?? "";
     const delegate = readObject(issue?.delegate);
