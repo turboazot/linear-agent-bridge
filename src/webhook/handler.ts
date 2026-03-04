@@ -688,6 +688,16 @@ async function isExplicitlyAddressed(input: {
       }
       return { ok: false, reason: `thread-owned-by-${ownerHandle}` };
     }
+    const issue = resolveIssue(data);
+    const issueId = readString(issue?.id) ?? readString(data.issueId as string) ?? "";
+    if (issueId) {
+      const info = await resolveIssueInfo(api, cfg, issueId);
+      const delegateId = info?.delegateId ?? "";
+      const delegateName = info?.delegateName ?? "";
+      if (isDelegatedToTarget(delegateId, delegateName, viewerId, cfg.mentionHandle)) {
+        return { ok: true, reason: "delegated-fallback" };
+      }
+    }
     return { ok: false, reason: "thread-owner-unknown" };
   }
 
