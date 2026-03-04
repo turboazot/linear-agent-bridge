@@ -162,33 +162,6 @@ async function handleWebhook(
     kind === "Comment" &&
     (!rawAction || rawAction === "create" || rawAction === "created" || rawAction === "prompted");
 
-  if (kind === "AppUserNotification") {
-    const notification = readObject(data.notification);
-    const payload = readObject(data.payload);
-    const entity = readObject(data.entity);
-    const subject = readObject(data.subject);
-    const organization = readObject(data.organization);
-    const candidates = [
-      readString(readObject(notification?.issue)?.id),
-      readString(readObject(payload?.issue)?.id),
-      readString(readObject(entity?.issue)?.id),
-      readString(readObject(subject?.issue)?.id),
-      readString(readObject(organization?.issue)?.id),
-      readString(notification?.issueId),
-      readString(payload?.issueId),
-      readString(entity?.issueId),
-      readString(subject?.issueId),
-      readString(organization?.issueId),
-      readString(data.issueId as string),
-      readString(readObject(resolveIssue(data))?.id),
-    ].filter(Boolean);
-    const topKeys = Object.keys(data).join(",");
-    const notificationKeys = notification ? Object.keys(notification).join(",") : "";
-    api.logger.info?.(
-      `linear app-notification action=${rawAction || "-"} notificationType=${notificationType || "-"} candidates=${candidates.length ? candidates.join("|") : "(none)"} keys=[${topKeys}] notificationKeys=[${notificationKeys}]`,
-    );
-  }
-
   // Strict trigger allowlist:
   // 1) issue delegated to app (notification event)
   // 2) comment created
@@ -204,22 +177,18 @@ async function handleWebhook(
 
   let sessionId = await resolveSessionIdWithFallback(api, cfg, data);
   let delegationSessionCreated = false;
-  let delegationReason = "";
   let delegationIssueId = "";
   if (!sessionId && isIssueAssignedNotification) {
-    const requireDelegateChange = false;
     const delegated = await createSessionForDelegatedIssue(
       api,
       cfg,
       data,
-      requireDelegateChange,
     );
     if (delegated.sessionId) {
       sessionId = delegated.sessionId;
       delegationSessionCreated = true;
       delegationIssueId = delegated.issueId;
     } else {
-      delegationReason = delegated.reason;
       api.logger.info?.(
         `linear delegation bootstrap skipped kind=${kind || "unknown"} reason=${delegated.reason || "-"}`,
       );
@@ -281,8 +250,7 @@ async function handleAgentEvent(
   let title = readString(issue?.title) ?? "";
   let url = readString(issue?.url) ?? "";
   let desc = readString(issue?.description) ?? "";
-  let issueTeamObj = readObject(issue?.team);
-  let teamId = readString(issueTeamObj?.id) ?? "";
+  let teamId = readString(readObject(issue?.team)?.id) ?? "";
   let team = resolveKey(issue?.team);
   let proj = resolveKey(issue?.project);
   const guidance = readString(data.guidance as string) ?? "";
@@ -708,7 +676,6 @@ async function createSessionForDelegatedIssue(
   api: OpenClawPluginApi,
   cfg: PluginConfig,
   data: Record<string, unknown>,
-  requireDelegateChange: boolean,
 ): Promise<{ sessionId: string; issueId: string; reason: string }> {
   const kind = readString(data.type as string) ?? "";
   const notificationType = (
@@ -718,19 +685,12 @@ async function createSessionForDelegatedIssue(
   )
     .trim()
     .toLowerCase();
-  const isIssueUpdate = kind === "Issue";
   const isIssueAssignedNotification =
     kind === "AppUserNotification" &&
     (notificationType === "issueassignedtoyou" ||
       notificationType === "issue_assigned_to_you");
-  if (!isIssueUpdate && !isIssueAssignedNotification) {
+  if (!isIssueAssignedNotification) {
     return { sessionId: "", issueId: "", reason: `unsupported-kind:${kind || "unknown"}` };
-  }
-  if (isIssueUpdate) {
-    const rawAction = (readString(data.action as string) ?? "").trim().toLowerCase();
-    if (rawAction && rawAction !== "update" && rawAction !== "updated") {
-      return { sessionId: "", issueId: "", reason: `unsupported-action:${rawAction}` };
-    }
   }
 
   const issue = resolveIssue(data);
@@ -791,14 +751,6 @@ async function createSessionForDelegatedIssue(
   if (!viewerId && !targetHandle) {
     return { sessionId: "", issueId, reason: "missing-viewer-and-mentionHandle" };
   }
-  if (
-    requireDelegateChange &&
-    !isIssueAssignedNotification &&
-    !didDelegateChangeToTarget(data, viewerId, targetHandle)
-  ) {
-    return { sessionId: "", issueId, reason: "delegate-change-not-targeted" };
-  }
-
   const delegate = readObject(issue?.delegate);
   let delegateId = readString(delegate?.id) ?? "";
   let delegateName =
@@ -840,47 +792,6 @@ async function createSessionForDelegatedIssue(
   };
 }
 
-function didDelegateChangeToTarget(
-  data: Record<string, unknown>,
-  viewerId: string,
-  targetHandle: string,
-): boolean {
-  if (!viewerId && !targetHandle) return false;
-  const updatedFrom = readObject(data.updatedFrom);
-  const updatedTo = readObject(data.updatedTo);
-
-  const fromDelegate = readDelegateField(updatedFrom);
-  const toDelegate = readDelegateField(updatedTo);
-
-  const fromMatches = delegateFieldMatchesTarget(fromDelegate, viewerId, targetHandle);
-  const toMatches = delegateFieldMatchesTarget(toDelegate, viewerId, targetHandle);
-
-  if (toMatches) {
-    return !fromMatches;
-  }
-  if (updatedFrom) {
-    const touchedDelegateField =
-      "delegateId" in updatedFrom ||
-      "delegate" in updatedFrom;
-    if (touchedDelegateField) {
-      return !fromMatches;
-    }
-  }
-  return false;
-}
-
-function readDelegateField(obj: Record<string, unknown> | undefined): string {
-  if (!obj) return "";
-  const delegateObj = readObject(obj.delegate);
-  return (
-    readString(obj.delegateId) ??
-    readString(delegateObj?.id) ??
-    readString(delegateObj?.name) ??
-    readString(delegateObj?.displayName) ??
-    ""
-  );
-}
-
 function normalizeMentionHandle(input: string | undefined): string {
   return (input ?? "").trim().toLowerCase().replace(/^@/, "");
 }
@@ -899,18 +810,6 @@ function isDelegatedToTarget(
   const targetHandle = normalizeMentionHandle(mentionHandle);
   if (!targetHandle) return false;
   return normalizeDelegateName(delegateName) === targetHandle;
-}
-
-function delegateFieldMatchesTarget(
-  rawValue: string,
-  viewerId: string,
-  targetHandle: string,
-): boolean {
-  const v = (rawValue ?? "").trim().toLowerCase();
-  if (!v) return false;
-  if (viewerId && v === viewerId.toLowerCase()) return true;
-  if (targetHandle && normalizeDelegateName(v) === targetHandle) return true;
-  return false;
 }
 
 function extractMentionHandles(text: string): Set<string> {
