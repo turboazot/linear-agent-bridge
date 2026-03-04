@@ -148,16 +148,21 @@ async function handleWebhook(
   }
   let sessionId = await resolveSessionIdWithFallback(api, cfg, data);
   let delegationSessionCreated = false;
+  let delegationReason = "";
   const delegatedChangeSession = await createSessionForDelegatedIssue(api, cfg, data, true);
-  if (delegatedChangeSession) {
-    sessionId = delegatedChangeSession;
+  if (delegatedChangeSession.sessionId) {
+    sessionId = delegatedChangeSession.sessionId;
     delegationSessionCreated = true;
+  } else {
+    delegationReason = delegatedChangeSession.reason;
   }
   if (!sessionId) {
     const created = await createSessionForDelegatedIssue(api, cfg, data, false);
-    if (created) {
-      sessionId = created;
+    if (created.sessionId) {
+      sessionId = created.sessionId;
       delegationSessionCreated = true;
+    } else if (created.reason) {
+      delegationReason = created.reason;
     }
   }
   if (!sessionId) {
@@ -168,6 +173,11 @@ async function handleWebhook(
         const nestedKeys = nested ? Object.keys(nested).join(",") : "";
         api.logger.info?.(
           `linear webhook ignored (${kind}) keys=[${topKeys}] dataKeys=[${nestedKeys}]`,
+        );
+      } else if (kind === "Issue") {
+        const action = readString(data.action as string) ?? "";
+        api.logger.info?.(
+          `linear webhook ignored (Issue) action=${action || "unknown"} reason=${delegationReason || "no-session"}`,
         );
       } else {
         api.logger.info?.(`linear webhook ignored (${kind})`);
@@ -512,11 +522,16 @@ async function isExplicitlyAddressed(input: {
     const issueId = readString(issue?.id) ?? readString(data.issueId as string) ?? "";
     const delegate = readObject(issue?.delegate);
     let delegateId = readString(delegate?.id) ?? "";
+    let delegateName =
+      readString(delegate?.name) ??
+      readString(delegate?.displayName) ??
+      "";
     if (!delegateId && issueId) {
       const info = await resolveIssueInfo(api, cfg, issueId);
       delegateId = info?.delegateId ?? "";
+      delegateName = info?.delegateName ?? delegateName;
     }
-    if (viewerId && delegateId && delegateId === viewerId) {
+    if (isDelegatedToTarget(delegateId, delegateName, viewerId, mentionHandle)) {
       return { ok: true, reason: "delegated-to-app" };
     }
     // In strict mode, also allow explicit mention on create events.
@@ -566,37 +581,56 @@ async function createSessionForDelegatedIssue(
   cfg: PluginConfig,
   data: Record<string, unknown>,
   requireDelegateChange: boolean,
-): Promise<string> {
+): Promise<{ sessionId: string; reason: string }> {
   const kind = readString(data.type as string) ?? "";
-  if (kind !== "Issue") return "";
+  if (kind !== "Issue") return { sessionId: "", reason: "not-issue" };
   const rawAction = (readString(data.action as string) ?? "").trim().toLowerCase();
-  if (rawAction && rawAction !== "update" && rawAction !== "updated") return "";
+  if (rawAction && rawAction !== "update" && rawAction !== "updated") {
+    return { sessionId: "", reason: `unsupported-action:${rawAction}` };
+  }
 
   const issue = resolveIssue(data);
-  const issueId = readString(issue?.id) ?? readString(data.issueId as string) ?? "";
-  if (!issueId) return "";
+  const issueId =
+    readString(issue?.id) ??
+    readString(data.issueId as string) ??
+    readString(data.id as string) ??
+    "";
+  if (!issueId) return { sessionId: "", reason: "missing-issue-id" };
 
   const viewerId = await resolveViewer(api, cfg);
-  if (!viewerId) return "";
-  if (requireDelegateChange && !didDelegateChangeToViewer(data, viewerId)) {
-    return "";
+  const targetHandle = normalizeMentionHandle(cfg.mentionHandle);
+  if (!viewerId && !targetHandle) {
+    return { sessionId: "", reason: "missing-viewer-and-mentionHandle" };
+  }
+  if (requireDelegateChange && !didDelegateChangeToTarget(data, viewerId, targetHandle)) {
+    return { sessionId: "", reason: "delegate-change-not-targeted" };
   }
 
   const delegate = readObject(issue?.delegate);
   let delegateId = readString(delegate?.id) ?? "";
+  let delegateName =
+    readString(delegate?.name) ??
+    readString(delegate?.displayName) ??
+    "";
   if (!delegateId) {
     const info = await resolveIssueInfo(api, cfg, issueId);
     delegateId = info?.delegateId ?? "";
+    delegateName = info?.delegateName ?? delegateName;
   }
-  if (!delegateId || delegateId !== viewerId) return "";
+  if (!isDelegatedToTarget(delegateId, delegateName, viewerId, cfg.mentionHandle)) {
+    return {
+      sessionId: "",
+      reason: `delegate-not-target id=${delegateId || "-"} name=${delegateName || "-"}`,
+    };
+  }
 
   const result = await callLinear(api, cfg, "agentSessionCreateOnIssue(delegate)", {
     query: AGENT_SESSION_CREATE_ON_ISSUE_MUTATION,
     variables: { issueId },
   });
-  if (!result.ok) return "";
+  if (!result.ok) return { sessionId: "", reason: "agentSessionCreateOnIssue-failed" };
   const root = readObject(result.data?.agentSessionCreateOnIssue);
-  if (!root || root.success !== true) return "";
+  if (!root || root.success !== true) return { sessionId: "", reason: "agentSessionCreateOnIssue-unsuccessful" };
   const session = readObject(root.agentSession);
   const sessionId = readString(session?.id) ?? "";
   if (sessionId) {
@@ -604,37 +638,82 @@ async function createSessionForDelegatedIssue(
       `linear handler: created session from delegation issue=${issueId.slice(0, 8)} session=${sessionId.slice(0, 8)}`,
     );
   }
-  return sessionId;
+  return {
+    sessionId,
+    reason: sessionId ? "ok" : "missing-session-id",
+  };
 }
 
-function didDelegateChangeToViewer(
+function didDelegateChangeToTarget(
   data: Record<string, unknown>,
   viewerId: string,
+  targetHandle: string,
 ): boolean {
-  if (!viewerId) return false;
+  if (!viewerId && !targetHandle) return false;
   const updatedFrom = readObject(data.updatedFrom);
   const updatedTo = readObject(data.updatedTo);
 
-  const fromDelegate =
-    readString(updatedFrom?.delegateId) ??
-    readString(readObject(updatedFrom?.delegate)?.id) ??
-    "";
-  const toDelegate =
-    readString(updatedTo?.delegateId) ??
-    readString(readObject(updatedTo?.delegate)?.id) ??
-    "";
+  const fromDelegate = readDelegateField(updatedFrom);
+  const toDelegate = readDelegateField(updatedTo);
 
-  if (toDelegate) {
-    return toDelegate === viewerId && fromDelegate !== viewerId;
+  const fromMatches = delegateFieldMatchesTarget(fromDelegate, viewerId, targetHandle);
+  const toMatches = delegateFieldMatchesTarget(toDelegate, viewerId, targetHandle);
+
+  if (toMatches) {
+    return !fromMatches;
   }
   if (updatedFrom) {
     const touchedDelegateField =
       "delegateId" in updatedFrom ||
       "delegate" in updatedFrom;
     if (touchedDelegateField) {
-      return fromDelegate !== viewerId;
+      return !fromMatches;
     }
   }
+  return false;
+}
+
+function readDelegateField(obj: Record<string, unknown> | undefined): string {
+  if (!obj) return "";
+  const delegateObj = readObject(obj.delegate);
+  return (
+    readString(obj.delegateId) ??
+    readString(delegateObj?.id) ??
+    readString(delegateObj?.name) ??
+    readString(delegateObj?.displayName) ??
+    ""
+  );
+}
+
+function normalizeMentionHandle(input: string | undefined): string {
+  return (input ?? "").trim().toLowerCase().replace(/^@/, "");
+}
+
+function normalizeDelegateName(input: string): string {
+  return (input ?? "").trim().toLowerCase().replace(/^@/, "");
+}
+
+function isDelegatedToTarget(
+  delegateId: string,
+  delegateName: string,
+  viewerId: string,
+  mentionHandle: string | undefined,
+): boolean {
+  if (viewerId && delegateId && delegateId === viewerId) return true;
+  const targetHandle = normalizeMentionHandle(mentionHandle);
+  if (!targetHandle) return false;
+  return normalizeDelegateName(delegateName) === targetHandle;
+}
+
+function delegateFieldMatchesTarget(
+  rawValue: string,
+  viewerId: string,
+  targetHandle: string,
+): boolean {
+  const v = (rawValue ?? "").trim().toLowerCase();
+  if (!v) return false;
+  if (viewerId && v === viewerId.toLowerCase()) return true;
+  if (targetHandle && normalizeDelegateName(v) === targetHandle) return true;
   return false;
 }
 

@@ -48,11 +48,16 @@ export async function resolveIssueInfo(
   const team = readObject(issue.team);
   const state = readObject(issue.state);
   const delegateObj = readObject(issue.delegate);
+  const delegateName =
+    readString(delegateObj?.name) ??
+    readString(delegateObj?.displayName) ??
+    "";
   return {
     id,
     teamId: readString(team?.id) ?? "",
     stateType: readString(state?.type) ?? "",
     delegateId: readString(delegateObj?.id) ?? "",
+    delegateName,
   };
 }
 

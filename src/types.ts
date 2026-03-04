@@ -93,4 +93,5 @@ export interface IssueInfo {
   teamId: string;
   stateType: string;
   delegateId: string;
+  delegateName?: string;
 }

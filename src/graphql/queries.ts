@@ -6,7 +6,7 @@ export const ISSUE_INFO_QUERY = `
       id
       state { type }
       team { id }
-      delegate { id }
+      delegate { id name displayName }
     }
   }
 `;
