@@ -68,7 +68,6 @@ const AGENT_TIMEOUT_MS = 30 * 60 * 1000;
 const inflightSessions = new Map<string, number>();
 const DEDUP_WINDOW_MS = 5_000;
 const delegationByIssue = new Map<string, { sessionId: string; at: number }>();
-const initializedSessions = new Set<string>();
 
 export function createLinearWebhook(
   api: OpenClawPluginApi,
@@ -283,10 +282,15 @@ async function handleAgentEvent(
 
   const context = resolveContext(data);
   const session = resolveSessionId(data);
-  const isFirstInSession = session ? !initializedSessions.has(session) : false;
-  const compactMessage = session ? !isFirstInSession : action === "prompted";
+  const comment = readObject(data.comment);
+  const parentId = readString(comment?.parentId) ?? readString(data.parentId as string) ?? "";
+  const mentionHandle = normalizeMentionHandle(cfg.mentionHandle);
+  const mentionSource = `${prompt}\n${readString(comment?.body) ?? ""}`.toLowerCase();
+  const mentionedHandles = extractMentionHandles(mentionSource);
+  const isRootMention = kind === "Comment" && !parentId && Boolean(mentionHandle) && mentionedHandles.has(mentionHandle);
+  const compactMessage = !(action === "created" || isRootMention);
   if (
-    isFirstInSession &&
+    (action === "created" || isRootMention) &&
     issueId &&
     (!id || !title || !url || !desc || !teamId)
   ) {
@@ -318,7 +322,6 @@ async function handleAgentEvent(
   }
   // Mark in-flight immediately (before any await) to prevent races.
   if (session) inflightSessions.set(session, Date.now());
-  if (session) initializedSessions.add(session);
 
   const key = normalizeKey(session || id || randomUUID());
   const sessionKey = `agent:${agent}:linear:${key}`;
