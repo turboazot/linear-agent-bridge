@@ -135,34 +135,63 @@ async function handleWebhook(
   delivery: string | undefined,
 ): Promise<void> {
   const kind = readString(data.type as string) ?? "";
+  const rawAction = (readString(data.action as string) ?? "").trim().toLowerCase();
+  const notificationType = (
+    readString(data.notificationType as string) ??
+    readString(readObject(data.notification)?.type) ??
+    ""
+  )
+    .trim()
+    .toLowerCase();
   if (kind === "PermissionChange" || kind === "OAuthApp") {
     logEvent(api, "permission", data);
-    return;
-  }
-  if (kind === "AppUserNotification") {
-    logEvent(api, "notification", data);
     return;
   }
   if (kind === "Comment" && (await isSelfAuthoredComment(api, cfg, data))) {
     return;
   }
+  const isIssueDelegatedUpdate =
+    kind === "Issue" && (!rawAction || rawAction === "update" || rawAction === "updated");
+  const isIssueAssignedNotification =
+    kind === "AppUserNotification" &&
+    (notificationType === "issueassignedtoyou" ||
+      notificationType === "issue_assigned_to_you");
+  const isCommentCreated =
+    kind === "Comment" &&
+    (!rawAction || rawAction === "create" || rawAction === "created" || rawAction === "prompted");
+
+  // Strict trigger allowlist:
+  // 1) issue delegated to app
+  // 2) comment created
+  // 3) thread comment created (covered by Comment + parentId handling later)
+  if (!isIssueDelegatedUpdate && !isIssueAssignedNotification && !isCommentCreated) {
+    if (kind === "AppUserNotification") {
+      logEvent(api, "notification", data);
+    } else if (kind) {
+      api.logger.info?.(`linear webhook ignored (${kind})`);
+    }
+    return;
+  }
+
   let sessionId = await resolveSessionIdWithFallback(api, cfg, data);
   let delegationSessionCreated = false;
   let delegationReason = "";
-  const delegatedChangeSession = await createSessionForDelegatedIssue(api, cfg, data, true);
-  if (delegatedChangeSession.sessionId) {
-    sessionId = delegatedChangeSession.sessionId;
-    delegationSessionCreated = true;
-  } else {
-    delegationReason = delegatedChangeSession.reason;
-  }
-  if (!sessionId) {
-    const created = await createSessionForDelegatedIssue(api, cfg, data, false);
-    if (created.sessionId) {
-      sessionId = created.sessionId;
+  if (!sessionId && (isIssueDelegatedUpdate || isIssueAssignedNotification)) {
+    const requireDelegateChange = isIssueDelegatedUpdate;
+    const delegated = await createSessionForDelegatedIssue(
+      api,
+      cfg,
+      data,
+      requireDelegateChange,
+    );
+    if (delegated.sessionId) {
+      sessionId = delegated.sessionId;
       delegationSessionCreated = true;
-    } else if (created.reason) {
-      delegationReason = created.reason;
+    } else {
+      delegationReason = delegated.reason;
+      api.logger.info?.(
+        `linear delegation bootstrap skipped kind=${kind || "unknown"} reason=${delegated.reason || "-"}`,
+      );
     }
   }
   if (!sessionId) {
@@ -228,22 +257,20 @@ async function handleAgentEvent(
     }
   }
 
-  if (cfg.strictAddressing === true) {
-    const viewerId = await resolveViewer(api, cfg);
-    const addressed = await isExplicitlyAddressed({
-      api,
-      cfg,
-      kind,
-      action,
-      data,
-      prompt,
-      viewerId,
-      mentionHandle: cfg.mentionHandle,
-    });
-    if (!addressed.ok) {
-      api.logger.info?.(`linear event ignored (strictAddressing: ${addressed.reason})`);
-      return;
-    }
+  const viewerId = await resolveViewer(api, cfg);
+  const addressed = await isExplicitlyAddressed({
+    api,
+    cfg,
+    kind,
+    action,
+    data,
+    prompt,
+    viewerId,
+    mentionHandle: cfg.mentionHandle,
+  });
+  if (!addressed.ok) {
+    api.logger.info?.(`linear event ignored (strictAddressing: ${addressed.reason})`);
+    return;
   }
 
   const context = resolveContext(data);
@@ -586,10 +613,26 @@ async function createSessionForDelegatedIssue(
   requireDelegateChange: boolean,
 ): Promise<{ sessionId: string; reason: string }> {
   const kind = readString(data.type as string) ?? "";
-  if (kind !== "Issue") return { sessionId: "", reason: "not-issue" };
-  const rawAction = (readString(data.action as string) ?? "").trim().toLowerCase();
-  if (rawAction && rawAction !== "update" && rawAction !== "updated") {
-    return { sessionId: "", reason: `unsupported-action:${rawAction}` };
+  const notificationType = (
+    readString(data.notificationType as string) ??
+    readString(readObject(data.notification)?.type) ??
+    ""
+  )
+    .trim()
+    .toLowerCase();
+  const isIssueUpdate = kind === "Issue";
+  const isIssueAssignedNotification =
+    kind === "AppUserNotification" &&
+    (notificationType === "issueassignedtoyou" ||
+      notificationType === "issue_assigned_to_you");
+  if (!isIssueUpdate && !isIssueAssignedNotification) {
+    return { sessionId: "", reason: `unsupported-kind:${kind || "unknown"}` };
+  }
+  if (isIssueUpdate) {
+    const rawAction = (readString(data.action as string) ?? "").trim().toLowerCase();
+    if (rawAction && rawAction !== "update" && rawAction !== "updated") {
+      return { sessionId: "", reason: `unsupported-action:${rawAction}` };
+    }
   }
 
   const issue = resolveIssue(data);
@@ -605,7 +648,11 @@ async function createSessionForDelegatedIssue(
   if (!viewerId && !targetHandle) {
     return { sessionId: "", reason: "missing-viewer-and-mentionHandle" };
   }
-  if (requireDelegateChange && !didDelegateChangeToTarget(data, viewerId, targetHandle)) {
+  if (
+    requireDelegateChange &&
+    !isIssueAssignedNotification &&
+    !didDelegateChangeToTarget(data, viewerId, targetHandle)
+  ) {
     return { sessionId: "", reason: "delegate-change-not-targeted" };
   }
 

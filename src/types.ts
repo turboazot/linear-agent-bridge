@@ -39,7 +39,6 @@ export interface PluginConfig {
   externalUrlLabel?: string;
   enableAgentApi?: boolean;
   apiBaseUrl?: string;
-  strictAddressing?: boolean;
   mentionHandle?: string;
 }
 
