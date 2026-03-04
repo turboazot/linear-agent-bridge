@@ -39,7 +39,6 @@ export interface PluginConfig {
   externalUrlLabel?: string;
   enableAgentApi?: boolean;
   apiBaseUrl?: string;
-  strictAddressing?: boolean;
   mentionHandle?: string;
 }
 
@@ -93,4 +92,5 @@ export interface IssueInfo {
   teamId: string;
   stateType: string;
   delegateId: string;
+  delegateName?: string;
 }

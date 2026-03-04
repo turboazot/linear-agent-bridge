@@ -62,8 +62,8 @@ export const COMMENT_CREATE_MUTATION = `
 `;
 
 export const AGENT_SESSION_CREATE_ON_ISSUE_MUTATION = `
-  mutation AgentSessionCreateOnIssue($issueId: String!) {
-    agentSessionCreateOnIssue(issueId: $issueId) {
+  mutation AgentSessionCreateOnIssue($input: AgentSessionCreateOnIssue!) {
+    agentSessionCreateOnIssue(input: $input) {
       success
       agentSession { id }
     }
@@ -71,8 +71,8 @@ export const AGENT_SESSION_CREATE_ON_ISSUE_MUTATION = `
 `;
 
 export const AGENT_SESSION_CREATE_ON_COMMENT_MUTATION = `
-  mutation AgentSessionCreateOnComment($commentId: String!) {
-    agentSessionCreateOnComment(commentId: $commentId) {
+  mutation AgentSessionCreateOnComment($input: AgentSessionCreateOnComment!) {
+    agentSessionCreateOnComment(input: $input) {
       success
       agentSession { id }
     }

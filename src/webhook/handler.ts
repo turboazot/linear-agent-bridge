@@ -11,7 +11,12 @@ import type {
 } from "../types.js";
 import { normalizeCfg } from "../config.js";
 import { callLinear, resolveViewer } from "../linear-client.js";
-import { ACTIVITY_MUTATION, SESSION_UPDATE_MUTATION } from "../graphql/mutations.js";
+import {
+  ACTIVITY_MUTATION,
+  SESSION_UPDATE_MUTATION,
+  AGENT_SESSION_CREATE_ON_ISSUE_MUTATION,
+} from "../graphql/mutations.js";
+import { ISSUE_DETAIL_QUERY } from "../graphql/queries.js";
 import {
   readBody,
   readHeader,
@@ -24,6 +29,7 @@ import { verifySignature } from "./validation.js";
 import {
   resolveSessionId,
   resolveSessionIdWithFallback,
+  resolveKnownSessionForIssue,
   resolveIssue,
   rememberSessionHint,
 } from "./session-resolver.js";
@@ -41,7 +47,7 @@ import {
   resolveExternal,
 } from "./message-builder.js";
 import { buildAgentResponse } from "./response-parser.js";
-import { applyIssuePolicy } from "./issue-policy.js";
+import { applyIssuePolicy, resolveIssueInfo } from "./issue-policy.js";
 import { isCloseIntentPrompt, closeIssueFromPrompt } from "./close-intent.js";
 import { shouldSkipPromptedRun, isSelfAuthoredComment } from "./skip-filter.js";
 import { createSessionToken, revokeSessionToken } from "../agent/session-token.js";
@@ -61,6 +67,7 @@ const AGENT_TIMEOUT_MS = 30 * 60 * 1000;
 // Maps session ID → timestamp when marked inflight.
 const inflightSessions = new Map<string, number>();
 const DEDUP_WINDOW_MS = 5_000;
+const delegationByIssue = new Map<string, { sessionId: string; at: number }>();
 
 export function createLinearWebhook(
   api: OpenClawPluginApi,
@@ -131,18 +138,61 @@ async function handleWebhook(
   delivery: string | undefined,
 ): Promise<void> {
   const kind = readString(data.type as string) ?? "";
+  const rawAction = (readString(data.action as string) ?? "").trim().toLowerCase();
+  const notificationType = (
+    readString(data.notificationType as string) ??
+    readString(readObject(data.notification)?.type) ??
+    ""
+  )
+    .trim()
+    .toLowerCase();
   if (kind === "PermissionChange" || kind === "OAuthApp") {
     logEvent(api, "permission", data);
-    return;
-  }
-  if (kind === "AppUserNotification") {
-    logEvent(api, "notification", data);
     return;
   }
   if (kind === "Comment" && (await isSelfAuthoredComment(api, cfg, data))) {
     return;
   }
-  const sessionId = await resolveSessionIdWithFallback(api, cfg, data);
+  const isIssueAssignedNotification =
+    kind === "AppUserNotification" &&
+    (notificationType === "issueassignedtoyou" ||
+      notificationType === "issue_assigned_to_you");
+  const isCommentCreated =
+    kind === "Comment" &&
+    (!rawAction || rawAction === "create" || rawAction === "created" || rawAction === "prompted");
+
+  // Strict trigger allowlist:
+  // 1) issue delegated to app (notification event)
+  // 2) comment created
+  // 3) thread comment created (covered by Comment + parentId handling later)
+  if (!isIssueAssignedNotification && !isCommentCreated) {
+    if (kind === "AppUserNotification") {
+      logEvent(api, "notification", data);
+    } else if (kind) {
+      api.logger.info?.(`linear webhook ignored (${kind})`);
+    }
+    return;
+  }
+
+  let sessionId = await resolveSessionIdWithFallback(api, cfg, data);
+  let delegationSessionCreated = false;
+  let delegationIssueId = "";
+  if (!sessionId && isIssueAssignedNotification) {
+    const delegated = await createSessionForDelegatedIssue(
+      api,
+      cfg,
+      data,
+    );
+    if (delegated.sessionId) {
+      sessionId = delegated.sessionId;
+      delegationSessionCreated = true;
+      delegationIssueId = delegated.issueId;
+    } else {
+      api.logger.info?.(
+        `linear delegation bootstrap skipped kind=${kind || "unknown"} reason=${delegated.reason || "-"}`,
+      );
+    }
+  }
   if (!sessionId) {
     if (kind) {
       if (kind === "Comment") {
@@ -158,10 +208,23 @@ async function handleWebhook(
     }
     return;
   }
-  const eventData = resolveSessionId(data)
-    ? data
+  const eventData: Record<string, unknown> = resolveSessionId(data)
+    ? { ...data }
     : { ...data, agentSessionId: sessionId };
+  if (delegationIssueId && !readString(eventData.issueId as string) && !readObject(eventData.issue)) {
+    eventData.issueId = delegationIssueId;
+  }
+  if (delegationSessionCreated) {
+    eventData.__delegationSessionCreated = true;
+  }
   rememberSessionHint(eventData, sessionId);
+  const eventIssueId =
+    readString(resolveIssue(eventData)?.id) ??
+    readString(eventData.issueId as string) ??
+    "";
+  if (eventIssueId && sessionId) {
+    delegationByIssue.set(eventIssueId, { sessionId, at: Date.now() });
+  }
   await handleAgentEvent(api, cfg, eventData, delivery);
 }
 
@@ -171,18 +234,24 @@ async function handleAgentEvent(
   data: Record<string, unknown>,
   delivery: string | undefined,
 ): Promise<void> {
-  const action = resolveAction(data);
+  let action = resolveAction(data);
+  if (!action && data.__delegationSessionCreated === true) {
+    action = "created";
+  }
   if (!action) {
     api.logger.info?.("linear agent event ignored");
     return;
   }
   const kind = readString(data.type as string) ?? "";
   const issue = resolveIssue(data);
-  const issueId = readString(issue?.id) ?? "";
-  const id = readString(issue?.identifier) ?? "";
-  const title = readString(issue?.title) ?? "";
-  const url = readString(issue?.url) ?? "";
-  const desc = readString(issue?.description) ?? "";
+  let issueId = readString(issue?.id) ?? "";
+  let id = readString(issue?.identifier) ?? "";
+  let title = readString(issue?.title) ?? "";
+  let url = readString(issue?.url) ?? "";
+  let desc = readString(issue?.description) ?? "";
+  let teamId = readString(readObject(issue?.team)?.id) ?? "";
+  let team = resolveKey(issue?.team);
+  let proj = resolveKey(issue?.project);
   const guidance = readString(data.guidance as string) ?? "";
   const prompt = resolvePrompt(data);
   if (action === "prompted") {
@@ -195,32 +264,50 @@ async function handleAgentEvent(
     }
   }
 
-  if (cfg.strictAddressing === true) {
-    const viewerId = await resolveViewer(api, cfg);
-    const addressed = await isExplicitlyAddressed({
-      api,
-      cfg,
-      kind,
-      action,
-      data,
-      prompt,
-      viewerId,
-      mentionHandle: cfg.mentionHandle,
-    });
-    if (!addressed.ok) {
-      api.logger.info?.(`linear event ignored (strictAddressing: ${addressed.reason})`);
-      return;
-    }
+  const viewerId = await resolveViewer(api, cfg);
+  const addressed = await isExplicitlyAddressed({
+    api,
+    cfg,
+    kind,
+    action,
+    data,
+    prompt,
+    viewerId,
+    mentionHandle: cfg.mentionHandle,
+  });
+  if (!addressed.ok) {
+    api.logger.info?.(`linear event ignored (strictAddressing: ${addressed.reason})`);
+    return;
   }
 
   const context = resolveContext(data);
-  const compactMessage = action === "prompted";
-  const team = resolveKey(issue?.team);
-  const proj = resolveKey(issue?.project);
+  const session = resolveSessionId(data);
+  const comment = readObject(data.comment);
+  const parentId = readString(comment?.parentId) ?? readString(data.parentId as string) ?? "";
+  const mentionHandle = normalizeMentionHandle(cfg.mentionHandle);
+  const mentionSource = `${prompt}\n${readString(comment?.body) ?? ""}`.toLowerCase();
+  const mentionedHandles = extractMentionHandles(mentionSource);
+  const isRootMention = kind === "Comment" && !parentId && Boolean(mentionHandle) && mentionedHandles.has(mentionHandle);
+  const compactMessage = !(action === "created" || isRootMention);
+  if (
+    (action === "created" || isRootMention) &&
+    issueId &&
+    (!id || !title || !url || !desc || !teamId)
+  ) {
+    const detail = await fetchIssueDetail(api, cfg, issueId);
+    if (detail) {
+      id ||= detail.identifier;
+      title ||= detail.title;
+      url ||= detail.url;
+      desc ||= detail.description;
+      teamId ||= detail.teamId;
+      team ||= detail.teamKey || detail.teamId;
+      proj ||= detail.projectKey || detail.projectId;
+    }
+  }
   const repo = resolveRepo(cfg, team, proj);
   const agent = cfg.devAgentId ?? "dev";
   const label = buildLabel(id, title);
-  const session = resolveSessionId(data);
 
   // Dedup: skip if an agent is already running for this session.
   // "prompted" (follow-up comment) actions are allowed through UNLESS
@@ -272,10 +359,6 @@ async function handleAgentEvent(
     }
     applyIssuePolicy(api, cfg, issueId).catch(() => {});
   }
-
-  // Resolve team ID for context
-  const issueTeamObj = readObject(issue?.team);
-  const teamId = readString(issueTeamObj?.id) ?? "";
 
   // Generate per-session API token for agent to call back
   const enableApi = cfg.enableAgentApi !== false;
@@ -427,6 +510,42 @@ async function handleAgentEvent(
   }
 }
 
+async function fetchIssueDetail(
+  api: OpenClawPluginApi,
+  cfg: PluginConfig,
+  issueId: string,
+): Promise<{
+  identifier: string;
+  title: string;
+  url: string;
+  description: string;
+  teamId: string;
+  teamKey: string;
+  projectId: string;
+  projectKey: string;
+} | null> {
+  if (!issueId) return null;
+  const result = await callLinear(api, cfg, "issue(detail)", {
+    query: ISSUE_DETAIL_QUERY,
+    variables: { id: issueId },
+  });
+  if (!result.ok) return null;
+  const issue = readObject(result.data?.issue);
+  if (!issue) return null;
+  const team = readObject(issue.team);
+  const project = readObject(issue.project);
+  return {
+    identifier: readString(issue.identifier) ?? "",
+    title: readString(issue.title) ?? "",
+    url: readString(issue.url) ?? "",
+    description: readString(issue.description) ?? "",
+    teamId: readString(team?.id) ?? "",
+    teamKey: readString(team?.key) ?? "",
+    projectId: readString(project?.id) ?? "",
+    projectKey: readString(project?.key) ?? "",
+  };
+}
+
 export async function postActivity(
   api: OpenClawPluginApi,
   cfg: PluginConfig,
@@ -485,10 +604,23 @@ async function isExplicitlyAddressed(input: {
 
   // Session creation events are allowed only when delegated to this app user.
   if (action === "created") {
+    if (data.__delegationSessionCreated === true) {
+      return { ok: true, reason: "delegation-session-created" };
+    }
     const issue = resolveIssue(data);
+    const issueId = readString(issue?.id) ?? readString(data.issueId as string) ?? "";
     const delegate = readObject(issue?.delegate);
-    const delegateId = readString(delegate?.id) ?? "";
-    if (viewerId && delegateId && delegateId === viewerId) {
+    let delegateId = readString(delegate?.id) ?? "";
+    let delegateName =
+      readString(delegate?.name) ??
+      readString(delegate?.displayName) ??
+      "";
+    if (!delegateId && issueId) {
+      const info = await resolveIssueInfo(api, cfg, issueId);
+      delegateId = info?.delegateId ?? "";
+      delegateName = info?.delegateName ?? delegateName;
+    }
+    if (isDelegatedToTarget(delegateId, delegateName, viewerId, mentionHandle)) {
       return { ok: true, reason: "delegated-to-app" };
     }
     // In strict mode, also allow explicit mention on create events.
@@ -527,10 +659,160 @@ async function isExplicitlyAddressed(input: {
       }
       return { ok: false, reason: `thread-owned-by-${ownerHandle}` };
     }
+    const issue = resolveIssue(data);
+    const issueId = readString(issue?.id) ?? readString(data.issueId as string) ?? "";
+    if (issueId) {
+      const info = await resolveIssueInfo(api, cfg, issueId);
+      const delegateId = info?.delegateId ?? "";
+      const delegateName = info?.delegateName ?? "";
+      if (isDelegatedToTarget(delegateId, delegateName, viewerId, cfg.mentionHandle)) {
+        return { ok: true, reason: "delegated-fallback" };
+      }
+    }
     return { ok: false, reason: "thread-owner-unknown" };
   }
 
   return { ok: false, reason: "not-addressed" };
+}
+
+async function createSessionForDelegatedIssue(
+  api: OpenClawPluginApi,
+  cfg: PluginConfig,
+  data: Record<string, unknown>,
+): Promise<{ sessionId: string; issueId: string; reason: string }> {
+  const kind = readString(data.type as string) ?? "";
+  const notificationType = (
+    readString(data.notificationType as string) ??
+    readString(readObject(data.notification)?.type) ??
+    ""
+  )
+    .trim()
+    .toLowerCase();
+  const isIssueAssignedNotification =
+    kind === "AppUserNotification" &&
+    (notificationType === "issueassignedtoyou" ||
+      notificationType === "issue_assigned_to_you");
+  if (!isIssueAssignedNotification) {
+    return { sessionId: "", issueId: "", reason: `unsupported-kind:${kind || "unknown"}` };
+  }
+
+  const issue = resolveIssue(data);
+  const notification = readObject(data.notification);
+  const payload = readObject(data.payload);
+  const entity = readObject(data.entity);
+  const subject = readObject(data.subject);
+  const organization = readObject(data.organization);
+  const orgIssue = readObject(organization?.issue);
+  const notificationIssue = readObject(notification?.issue);
+  const payloadIssue = readObject(payload?.issue);
+  const entityIssue = readObject(entity?.issue);
+  const subjectIssue = readObject(subject?.issue);
+  const issueId =
+    readString(issue?.id) ??
+    readString(notificationIssue?.id) ??
+    readString(payloadIssue?.id) ??
+    readString(entityIssue?.id) ??
+    readString(subjectIssue?.id) ??
+    readString(orgIssue?.id) ??
+    readString(notification?.issueId) ??
+    readString(payload?.issueId) ??
+    readString(entity?.issueId) ??
+    readString(subject?.issueId) ??
+    readString(organization?.issueId) ??
+    readString(data.issueId as string) ??
+    readString(data.id as string) ??
+    "";
+  if (!issueId) {
+    const topKeys = Object.keys(data).join(",");
+    const notificationKeys = notification ? Object.keys(notification).join(",") : "";
+    api.logger.info?.(
+      `linear delegation issue id missing kind=${kind || "unknown"} notificationType=${notificationType || "-"} keys=[${topKeys}] notificationKeys=[${notificationKeys}]`,
+    );
+    return { sessionId: "", issueId: "", reason: "missing-issue-id" };
+  }
+
+  const recent = delegationByIssue.get(issueId);
+  if (recent?.sessionId) {
+    return {
+      sessionId: recent.sessionId,
+      issueId,
+      reason: "existing-issue-session-cache",
+    };
+  }
+  const existingSession = await resolveKnownSessionForIssue(api, cfg, issueId);
+  if (existingSession) {
+    delegationByIssue.set(issueId, { sessionId: existingSession, at: Date.now() });
+    return {
+      sessionId: existingSession,
+      issueId,
+      reason: "existing-issue-session-linear",
+    };
+  }
+
+  const viewerId = await resolveViewer(api, cfg);
+  const targetHandle = normalizeMentionHandle(cfg.mentionHandle);
+  if (!viewerId && !targetHandle) {
+    return { sessionId: "", issueId, reason: "missing-viewer-and-mentionHandle" };
+  }
+  const delegate = readObject(issue?.delegate);
+  let delegateId = readString(delegate?.id) ?? "";
+  let delegateName =
+    readString(delegate?.name) ??
+    readString(delegate?.displayName) ??
+    "";
+  if (!delegateId) {
+    const info = await resolveIssueInfo(api, cfg, issueId);
+    delegateId = info?.delegateId ?? "";
+    delegateName = info?.delegateName ?? delegateName;
+  }
+  if (!isDelegatedToTarget(delegateId, delegateName, viewerId, cfg.mentionHandle)) {
+    return {
+      sessionId: "",
+      issueId,
+      reason: `delegate-not-target id=${delegateId || "-"} name=${delegateName || "-"}`,
+    };
+  }
+
+  const result = await callLinear(api, cfg, "agentSessionCreateOnIssue(delegate)", {
+    query: AGENT_SESSION_CREATE_ON_ISSUE_MUTATION,
+    variables: { input: { issueId } },
+  });
+  if (!result.ok) return { sessionId: "", issueId, reason: "agentSessionCreateOnIssue-failed" };
+  const root = readObject(result.data?.agentSessionCreateOnIssue);
+  if (!root || root.success !== true) return { sessionId: "", issueId, reason: "agentSessionCreateOnIssue-unsuccessful" };
+  const session = readObject(root.agentSession);
+  const sessionId = readString(session?.id) ?? "";
+  if (sessionId) {
+    delegationByIssue.set(issueId, { sessionId, at: Date.now() });
+    api.logger.info?.(
+      `linear handler: created session from delegation issue=${issueId.slice(0, 8)} session=${sessionId.slice(0, 8)}`,
+    );
+  }
+  return {
+    sessionId,
+    issueId,
+    reason: sessionId ? "ok" : "missing-session-id",
+  };
+}
+
+function normalizeMentionHandle(input: string | undefined): string {
+  return (input ?? "").trim().toLowerCase().replace(/^@/, "");
+}
+
+function normalizeDelegateName(input: string): string {
+  return (input ?? "").trim().toLowerCase().replace(/^@/, "");
+}
+
+function isDelegatedToTarget(
+  delegateId: string,
+  delegateName: string,
+  viewerId: string,
+  mentionHandle: string | undefined,
+): boolean {
+  if (viewerId && delegateId && delegateId === viewerId) return true;
+  const targetHandle = normalizeMentionHandle(mentionHandle);
+  if (!targetHandle) return false;
+  return normalizeDelegateName(delegateName) === targetHandle;
 }
 
 function extractMentionHandles(text: string): Set<string> {

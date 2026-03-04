@@ -48,7 +48,7 @@ registerApiHandler("/session/create-on-issue", async ({ api, cfg, body, res }) =
 
   const result = await callLinear(api, cfg, "agentSessionCreateOnIssue", {
     query: AGENT_SESSION_CREATE_ON_ISSUE_MUTATION,
-    variables: { issueId },
+    variables: { input: { issueId } },
   });
   if (!result.ok) {
     sendJson(res, 502, { ok: false, error: "Linear API error" });
@@ -72,7 +72,7 @@ registerApiHandler("/session/create-on-comment", async ({ api, cfg, body, res })
 
   const result = await callLinear(api, cfg, "agentSessionCreateOnComment", {
     query: AGENT_SESSION_CREATE_ON_COMMENT_MUTATION,
-    variables: { commentId },
+    variables: { input: { commentId } },
   });
   if (!result.ok) {
     sendJson(res, 502, { ok: false, error: "Linear API error" });
