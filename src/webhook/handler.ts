@@ -11,7 +11,11 @@ import type {
 } from "../types.js";
 import { normalizeCfg } from "../config.js";
 import { callLinear, resolveViewer } from "../linear-client.js";
-import { ACTIVITY_MUTATION, SESSION_UPDATE_MUTATION } from "../graphql/mutations.js";
+import {
+  ACTIVITY_MUTATION,
+  SESSION_UPDATE_MUTATION,
+  AGENT_SESSION_CREATE_ON_ISSUE_MUTATION,
+} from "../graphql/mutations.js";
 import {
   readBody,
   readHeader,
@@ -41,7 +45,7 @@ import {
   resolveExternal,
 } from "./message-builder.js";
 import { buildAgentResponse } from "./response-parser.js";
-import { applyIssuePolicy } from "./issue-policy.js";
+import { applyIssuePolicy, resolveIssueInfo } from "./issue-policy.js";
 import { isCloseIntentPrompt, closeIssueFromPrompt } from "./close-intent.js";
 import { shouldSkipPromptedRun, isSelfAuthoredComment } from "./skip-filter.js";
 import { createSessionToken, revokeSessionToken } from "../agent/session-token.js";
@@ -142,7 +146,15 @@ async function handleWebhook(
   if (kind === "Comment" && (await isSelfAuthoredComment(api, cfg, data))) {
     return;
   }
-  const sessionId = await resolveSessionIdWithFallback(api, cfg, data);
+  let sessionId = await resolveSessionIdWithFallback(api, cfg, data);
+  let delegationSessionCreated = false;
+  if (!sessionId) {
+    const created = await createSessionForDelegatedIssue(api, cfg, data);
+    if (created) {
+      sessionId = created;
+      delegationSessionCreated = true;
+    }
+  }
   if (!sessionId) {
     if (kind) {
       if (kind === "Comment") {
@@ -158,9 +170,12 @@ async function handleWebhook(
     }
     return;
   }
-  const eventData = resolveSessionId(data)
-    ? data
+  const eventData: Record<string, unknown> = resolveSessionId(data)
+    ? { ...data }
     : { ...data, agentSessionId: sessionId };
+  if (delegationSessionCreated) {
+    eventData.__delegationSessionCreated = true;
+  }
   rememberSessionHint(eventData, sessionId);
   await handleAgentEvent(api, cfg, eventData, delivery);
 }
@@ -171,7 +186,10 @@ async function handleAgentEvent(
   data: Record<string, unknown>,
   delivery: string | undefined,
 ): Promise<void> {
-  const action = resolveAction(data);
+  let action = resolveAction(data);
+  if (!action && data.__delegationSessionCreated === true) {
+    action = "created";
+  }
   if (!action) {
     api.logger.info?.("linear agent event ignored");
     return;
@@ -486,8 +504,13 @@ async function isExplicitlyAddressed(input: {
   // Session creation events are allowed only when delegated to this app user.
   if (action === "created") {
     const issue = resolveIssue(data);
+    const issueId = readString(issue?.id) ?? readString(data.issueId as string) ?? "";
     const delegate = readObject(issue?.delegate);
-    const delegateId = readString(delegate?.id) ?? "";
+    let delegateId = readString(delegate?.id) ?? "";
+    if (!delegateId && issueId) {
+      const info = await resolveIssueInfo(api, cfg, issueId);
+      delegateId = info?.delegateId ?? "";
+    }
     if (viewerId && delegateId && delegateId === viewerId) {
       return { ok: true, reason: "delegated-to-app" };
     }
@@ -531,6 +554,48 @@ async function isExplicitlyAddressed(input: {
   }
 
   return { ok: false, reason: "not-addressed" };
+}
+
+async function createSessionForDelegatedIssue(
+  api: OpenClawPluginApi,
+  cfg: PluginConfig,
+  data: Record<string, unknown>,
+): Promise<string> {
+  const kind = readString(data.type as string) ?? "";
+  if (kind !== "Issue") return "";
+  const rawAction = (readString(data.action as string) ?? "").trim().toLowerCase();
+  if (rawAction && rawAction !== "update" && rawAction !== "updated") return "";
+
+  const issue = resolveIssue(data);
+  const issueId = readString(issue?.id) ?? readString(data.issueId as string) ?? "";
+  if (!issueId) return "";
+
+  const viewerId = await resolveViewer(api, cfg);
+  if (!viewerId) return "";
+
+  const delegate = readObject(issue?.delegate);
+  let delegateId = readString(delegate?.id) ?? "";
+  if (!delegateId) {
+    const info = await resolveIssueInfo(api, cfg, issueId);
+    delegateId = info?.delegateId ?? "";
+  }
+  if (!delegateId || delegateId !== viewerId) return "";
+
+  const result = await callLinear(api, cfg, "agentSessionCreateOnIssue(delegate)", {
+    query: AGENT_SESSION_CREATE_ON_ISSUE_MUTATION,
+    variables: { issueId },
+  });
+  if (!result.ok) return "";
+  const root = readObject(result.data?.agentSessionCreateOnIssue);
+  if (!root || root.success !== true) return "";
+  const session = readObject(root.agentSession);
+  const sessionId = readString(session?.id) ?? "";
+  if (sessionId) {
+    api.logger.info?.(
+      `linear handler: created session from delegation issue=${issueId.slice(0, 8)} session=${sessionId.slice(0, 8)}`,
+    );
+  }
+  return sessionId;
 }
 
 function extractMentionHandles(text: string): Set<string> {
