@@ -148,8 +148,13 @@ async function handleWebhook(
   }
   let sessionId = await resolveSessionIdWithFallback(api, cfg, data);
   let delegationSessionCreated = false;
+  const delegatedChangeSession = await createSessionForDelegatedIssue(api, cfg, data, true);
+  if (delegatedChangeSession) {
+    sessionId = delegatedChangeSession;
+    delegationSessionCreated = true;
+  }
   if (!sessionId) {
-    const created = await createSessionForDelegatedIssue(api, cfg, data);
+    const created = await createSessionForDelegatedIssue(api, cfg, data, false);
     if (created) {
       sessionId = created;
       delegationSessionCreated = true;
@@ -560,6 +565,7 @@ async function createSessionForDelegatedIssue(
   api: OpenClawPluginApi,
   cfg: PluginConfig,
   data: Record<string, unknown>,
+  requireDelegateChange: boolean,
 ): Promise<string> {
   const kind = readString(data.type as string) ?? "";
   if (kind !== "Issue") return "";
@@ -572,6 +578,9 @@ async function createSessionForDelegatedIssue(
 
   const viewerId = await resolveViewer(api, cfg);
   if (!viewerId) return "";
+  if (requireDelegateChange && !didDelegateChangeToViewer(data, viewerId)) {
+    return "";
+  }
 
   const delegate = readObject(issue?.delegate);
   let delegateId = readString(delegate?.id) ?? "";
@@ -596,6 +605,37 @@ async function createSessionForDelegatedIssue(
     );
   }
   return sessionId;
+}
+
+function didDelegateChangeToViewer(
+  data: Record<string, unknown>,
+  viewerId: string,
+): boolean {
+  if (!viewerId) return false;
+  const updatedFrom = readObject(data.updatedFrom);
+  const updatedTo = readObject(data.updatedTo);
+
+  const fromDelegate =
+    readString(updatedFrom?.delegateId) ??
+    readString(readObject(updatedFrom?.delegate)?.id) ??
+    "";
+  const toDelegate =
+    readString(updatedTo?.delegateId) ??
+    readString(readObject(updatedTo?.delegate)?.id) ??
+    "";
+
+  if (toDelegate) {
+    return toDelegate === viewerId && fromDelegate !== viewerId;
+  }
+  if (updatedFrom) {
+    const touchedDelegateField =
+      "delegateId" in updatedFrom ||
+      "delegate" in updatedFrom;
+    if (touchedDelegateField) {
+      return fromDelegate !== viewerId;
+    }
+  }
+  return false;
 }
 
 function extractMentionHandles(text: string): Set<string> {
