@@ -269,6 +269,151 @@ export async function postActivity(
   await postLinearActivity(api, cfg, session, content, opts);
 }
 
+async function updateSessionExternalUrl(
+  api: OpenClawPluginApi,
+  cfg: PluginConfig,
+  session: string,
+  url: string,
+  label: string,
+): Promise<void> {
+  if (!session || !url) return;
+  const input = { addedExternalUrls: [{ label, url }] };
+  const result = await callLinear(api, cfg, "agentSessionUpdate", {
+    query: SESSION_UPDATE_MUTATION,
+    variables: { id: session, input },
+  });
+  if (!result.ok) return;
+  const root = readObject(result.data!.agentSessionUpdate);
+  if (root && root.success === true) return;
+  api.logger.warn?.("linear agentSessionUpdate failed");
+}
+
+async function isExplicitlyAddressed(input: {
+  api: OpenClawPluginApi;
+  cfg: PluginConfig;
+  kind: string;
+  action: string;
+  data: Record<string, unknown>;
+  prompt: string;
+  viewerId: string;
+  mentionHandle?: string;
+}): Promise<{ ok: boolean; reason: string }> {
+  const { api, cfg, kind, action, data, prompt, viewerId, mentionHandle } = input;
+
+  if (action === "created") {
+    const issue = resolveIssue(data);
+    const delegate = readObject(issue?.delegate);
+    const delegateId = readString(delegate?.id) ?? "";
+    if (viewerId && delegateId && delegateId === viewerId) {
+      return { ok: true, reason: "delegated-to-app" };
+    }
+    const handle = (mentionHandle ?? "").trim().toLowerCase().replace(/^@/, "");
+    const createdMentions = extractMentionHandles((prompt ?? "").toLowerCase());
+    if (handle && createdMentions.has(handle)) {
+      return { ok: true, reason: "explicit-mention-on-create" };
+    }
+    return { ok: false, reason: "created-without-delegation" };
+  }
+
+  const comment = readObject(data.comment);
+  const bodyRaw = `${prompt}
+${readString(comment?.body) ?? ""}`;
+  const body = bodyRaw.toLowerCase();
+  const handle = (mentionHandle ?? "").trim().toLowerCase().replace(/^@/, "");
+  const mentionedHandles = extractMentionHandles(body);
+
+  if (mentionedHandles.size > 0 && handle && !mentionedHandles.has(handle)) {
+    return { ok: false, reason: "mentioned-other-bot" };
+  }
+
+  if (handle && mentionedHandles.has(handle)) {
+    return { ok: true, reason: "explicit-mention" };
+  }
+
+  const parentId = readString(comment?.parentId) ?? readString(data.parentId as string) ?? "";
+  const commentId = readString(comment?.id) ?? readString(data.commentId as string) ?? "";
+  if (kind === "Comment" && parentId) {
+    const ownerHandle = await resolveThreadOwnerHandle(api, cfg, commentId, handle);
+    if (ownerHandle) {
+      if (handle && ownerHandle === handle) {
+        return { ok: true, reason: "thread-owned-by-us" };
+      }
+      return { ok: false, reason: `thread-owned-by-${ownerHandle}` };
+    }
+    return { ok: false, reason: "thread-owner-unknown" };
+  }
+
+  return { ok: false, reason: "not-addressed" };
+}
+
+function extractMentionHandles(text: string): Set<string> {
+  const matches = Array.from((text ?? "").matchAll(/@([a-z0-9._-]+)/gi));
+  return new Set(matches.map((m) => (m[1] ?? "").toLowerCase()).filter(Boolean));
+}
+
+function pickThreadOwnerHandle(handles: Set<string>, expectedHandle?: string): string {
+  const expected = (expectedHandle ?? "").trim().toLowerCase().replace(/^@/, "");
+  if (expected && handles.has(expected)) return expected;
+  return handles.values().next().value ?? "";
+}
+
+async function resolveThreadOwnerHandle(
+  api: OpenClawPluginApi,
+  cfg: PluginConfig,
+  commentId: string,
+  expectedHandle?: string,
+): Promise<string> {
+  if (!commentId) return "";
+  const { COMMENT_THREAD_NODE_QUERY } = await import("../graphql/queries.js");
+
+  let currentId = commentId;
+  let safety = 0;
+  while (currentId && safety < 12) {
+    safety += 1;
+    const result = await callLinear(api, cfg, "commentThreadNode", {
+      query: COMMENT_THREAD_NODE_QUERY,
+      variables: { id: currentId },
+    });
+    if (!result.ok) return "";
+    const node = readObject(result.data?.comment);
+    if (!node) return "";
+
+    const parentId = readString(node.parentId) ?? "";
+    const body = readString(node.body) ?? "";
+
+    if (!parentId) {
+      const handles = extractMentionHandles(body.toLowerCase());
+      return pickThreadOwnerHandle(handles, expectedHandle);
+    }
+
+    const parent = readObject(node.parent);
+    const parentObjId = readString(parent?.id) ?? "";
+    const parentObjParentId = readString(parent?.parentId) ?? "";
+    if (parent && parentObjId && !parentObjParentId) {
+      const rootBody = readString(parent.body) ?? "";
+      const handles = extractMentionHandles(rootBody.toLowerCase());
+      return pickThreadOwnerHandle(handles, expectedHandle);
+    }
+
+    currentId = parentObjId || parentId;
+  }
+  return "";
+}
+
+function normalizePayload(
+  input: unknown,
+): Record<string, unknown> {
+  const root = readObject(input);
+  if (!root) return {};
+  const nested = readObject(root.data);
+  if (!nested) return root;
+  const out: Record<string, unknown> = { ...root, ...nested };
+  const kind = readString(out.type as string) ?? "";
+  if (kind === "Comment" && !readObject(out.comment)) out.comment = nested;
+  if (kind === "Issue" && !readObject(out.issue)) out.issue = nested;
+  return out;
+}
+
 function logEvent(
   api: OpenClawPluginApi,
   label: string,
