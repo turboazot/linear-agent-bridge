@@ -28,6 +28,8 @@ export function normalizeCfg(
     agentTimeoutMs: readCfgPositiveInt(cfg, "agentTimeoutMs"),
     linearRequestTimeoutMs: readCfgPositiveInt(cfg, "linearRequestTimeoutMs"),
     heartbeatIntervalMs: readCfgPositiveInt(cfg, "heartbeatIntervalMs"),
+    apiCorsOrigins: readCfgStringArray(cfg, "apiCorsOrigins"),
+    apiCorsAllowCredentials: readCfgBool(cfg, "apiCorsAllowCredentials"),
   };
 }
 
@@ -74,4 +76,17 @@ function readCfgPositiveInt(
   if (typeof raw !== "number" || !Number.isFinite(raw)) return undefined;
   const value = Math.trunc(raw);
   return value > 0 ? value : undefined;
+}
+
+function readCfgStringArray(
+  cfg: Record<string, unknown>,
+  key: string,
+): string[] | undefined {
+  const raw = cfg[key];
+  if (!Array.isArray(raw)) return undefined;
+  const values = raw
+    .filter((v): v is string => typeof v === "string")
+    .map((v) => v.trim())
+    .filter(Boolean);
+  return values.length > 0 ? values : undefined;
 }

@@ -51,7 +51,10 @@ export interface PluginConfig {
   agentTimeoutMs?: number;
   linearRequestTimeoutMs?: number;
   heartbeatIntervalMs?: number;
+  apiCorsOrigins?: string[];
+  apiCorsAllowCredentials?: boolean;
 }
+
 
 export type ActivityType =
   | "thought"
