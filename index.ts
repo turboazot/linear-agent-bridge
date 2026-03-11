@@ -13,21 +13,25 @@ import "./src/api/query-ops.js";
 export default function register(api: OpenClawPluginApi): void {
   api.registerHttpRoute({
     path: "/plugins/linear/linear",
+    auth: "plugin",
     handler: createLinearWebhook(api),
   });
 
   api.registerHttpRoute({
     path: "/plugins/linear/api",
+    auth: "plugin",
     handler: createApiRouter(api),
   });
 
   api.registerHttpRoute({
     path: "/plugins/linear/oauth/callback",
+    auth: "plugin",
     handler: createLinearOauthRoute(api),
   });
 
   api.registerHttpRoute({
     path: "/plugins/linear/oauth/exchange",
+    auth: "plugin",
     handler: createLinearOauthRoute(api),
   });
 }

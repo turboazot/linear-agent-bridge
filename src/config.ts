@@ -25,6 +25,9 @@ export function normalizeCfg(
     enableAgentApi: readCfgBool(cfg, "enableAgentApi"),
     apiBaseUrl: readCfgString(cfg, "apiBaseUrl"),
     mentionHandle: readCfgString(cfg, "mentionHandle"),
+    agentTimeoutMs: readCfgPositiveInt(cfg, "agentTimeoutMs"),
+    linearRequestTimeoutMs: readCfgPositiveInt(cfg, "linearRequestTimeoutMs"),
+    heartbeatIntervalMs: readCfgPositiveInt(cfg, "heartbeatIntervalMs"),
   };
 }
 
@@ -61,4 +64,14 @@ function readCfgMap(
     }
   }
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function readCfgPositiveInt(
+  cfg: Record<string, unknown>,
+  key: string,
+): number | undefined {
+  const raw = cfg[key];
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return undefined;
+  const value = Math.trunc(raw);
+  return value > 0 ? value : undefined;
 }

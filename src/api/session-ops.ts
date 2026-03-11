@@ -1,13 +1,13 @@
 import { registerApiHandler } from "./router.js";
-import { callLinear } from "../linear-client.js";
-import {
-  SESSION_UPDATE_MUTATION,
-  AGENT_SESSION_CREATE_ON_ISSUE_MUTATION,
-  AGENT_SESSION_CREATE_ON_COMMENT_MUTATION,
-} from "../graphql/mutations.js";
 import type { PlanStep } from "../types.js";
 import { setPlan } from "../agent/plan-manager.js";
 import { readObject, readString, readArray, sendJson } from "../util.js";
+import {
+  createLinearSessionOnComment,
+  createLinearSessionOnIssue,
+  updateLinearSessionExternalUrl,
+  updateLinearSessionPlan,
+} from "../linear-session-service.js";
 
 // POST /session/plan
 registerApiHandler("/session/plan", async ({ api, cfg, context, body, res }) => {
@@ -27,11 +27,8 @@ registerApiHandler("/session/plan", async ({ api, cfg, context, body, res }) => 
 
   setPlan(context.sessionId, plan);
 
-  const result = await callLinear(api, cfg, "agentSessionUpdate(plan)", {
-    query: SESSION_UPDATE_MUTATION,
-    variables: { id: context.sessionId, input: { plan } },
-  });
-  if (!result.ok) {
+  const ok = await updateLinearSessionPlan(api, cfg, context.sessionId, plan);
+  if (!ok) {
     sendJson(res, 502, { ok: false, error: "Linear API error" });
     return;
   }
@@ -46,19 +43,14 @@ registerApiHandler("/session/create-on-issue", async ({ api, cfg, body, res }) =
     return;
   }
 
-  const result = await callLinear(api, cfg, "agentSessionCreateOnIssue", {
-    query: AGENT_SESSION_CREATE_ON_ISSUE_MUTATION,
-    variables: { input: { issueId } },
-  });
-  if (!result.ok) {
+  const sessionId = await createLinearSessionOnIssue(api, cfg, issueId);
+  if (!sessionId) {
     sendJson(res, 502, { ok: false, error: "Linear API error" });
     return;
   }
-  const root = readObject(result.data!.agentSessionCreateOnIssue);
-  const session = readObject(root?.agentSession);
   sendJson(res, 200, {
-    ok: root?.success === true,
-    sessionId: readString(session?.id),
+    ok: true,
+    sessionId,
   });
 });
 
@@ -70,19 +62,14 @@ registerApiHandler("/session/create-on-comment", async ({ api, cfg, body, res })
     return;
   }
 
-  const result = await callLinear(api, cfg, "agentSessionCreateOnComment", {
-    query: AGENT_SESSION_CREATE_ON_COMMENT_MUTATION,
-    variables: { input: { commentId } },
-  });
-  if (!result.ok) {
+  const sessionId = await createLinearSessionOnComment(api, cfg, commentId);
+  if (!sessionId) {
     sendJson(res, 502, { ok: false, error: "Linear API error" });
     return;
   }
-  const root = readObject(result.data!.agentSessionCreateOnComment);
-  const session = readObject(root?.agentSession);
   sendJson(res, 200, {
-    ok: root?.success === true,
-    sessionId: readString(session?.id),
+    ok: true,
+    sessionId,
   });
 });
 
@@ -95,14 +82,8 @@ registerApiHandler("/session/external-url", async ({ api, cfg, context, body, re
     return;
   }
 
-  const result = await callLinear(api, cfg, "agentSessionUpdate(externalUrl)", {
-    query: SESSION_UPDATE_MUTATION,
-    variables: {
-      id: context.sessionId,
-      input: { addedExternalUrls: [{ label, url }] },
-    },
-  });
-  if (!result.ok) {
+  const ok = await updateLinearSessionExternalUrl(api, cfg, context.sessionId, url, label);
+  if (!ok) {
     sendJson(res, 502, { ok: false, error: "Linear API error" });
     return;
   }

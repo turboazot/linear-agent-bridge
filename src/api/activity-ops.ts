@@ -1,5 +1,5 @@
 import { registerApiHandler } from "./router.js";
-import { postActivity } from "../webhook/handler.js";
+import { postLinearActivity } from "../linear-session-service.js";
 import { readString, sendJson } from "../util.js";
 import { markResponsePosted } from "../agent/response-tracker.js";
 
@@ -10,7 +10,7 @@ registerApiHandler("/activity/thought", async ({ api, cfg, context, body, res })
     sendJson(res, 400, { ok: false, error: "body is required" });
     return;
   }
-  await postActivity(
+  await postLinearActivity(
     api,
     cfg,
     context.sessionId,
@@ -27,7 +27,7 @@ registerApiHandler("/activity/action", async ({ api, cfg, context, body, res }) 
     sendJson(res, 400, { ok: false, error: "activityAction is required" });
     return;
   }
-  await postActivity(api, cfg, context.sessionId, {
+  await postLinearActivity(api, cfg, context.sessionId, {
     type: "action",
     action: activityAction,
     parameter: readString(body.parameter as string),
@@ -43,7 +43,7 @@ registerApiHandler("/activity/elicitation", async ({ api, cfg, context, body, re
     sendJson(res, 400, { ok: false, error: "body is required" });
     return;
   }
-  await postActivity(
+  await postLinearActivity(
     api,
     cfg,
     context.sessionId,
@@ -63,7 +63,7 @@ registerApiHandler("/activity/response", async ({ api, cfg, context, body, res }
     sendJson(res, 400, { ok: false, error: "body is required" });
     return;
   }
-  await postActivity(api, cfg, context.sessionId, {
+  await postLinearActivity(api, cfg, context.sessionId, {
     type: "response",
     body: text,
   });
@@ -78,7 +78,7 @@ registerApiHandler("/activity/error", async ({ api, cfg, context, body, res }) =
     sendJson(res, 400, { ok: false, error: "body is required" });
     return;
   }
-  await postActivity(api, cfg, context.sessionId, {
+  await postLinearActivity(api, cfg, context.sessionId, {
     type: "error",
     body: text,
   });

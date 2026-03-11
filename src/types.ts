@@ -10,8 +10,16 @@ export interface OpenClawPluginApi {
     debug?: (msg: string) => void;
   };
   callGateway?: unknown;
+  onAgentEvent?: (
+    listener: (event: AgentEventPayload) => void,
+    opts?: {
+      runId?: string;
+      sessionKey?: string;
+    },
+  ) => () => void;
   registerHttpRoute: (opts: {
     path: string;
+    auth: "gateway" | "plugin";
     handler: (
       req: IncomingMessage,
       res: ServerResponse,
@@ -40,6 +48,9 @@ export interface PluginConfig {
   enableAgentApi?: boolean;
   apiBaseUrl?: string;
   mentionHandle?: string;
+  agentTimeoutMs?: number;
+  linearRequestTimeoutMs?: number;
+  heartbeatIntervalMs?: number;
 }
 
 export type ActivityType =
@@ -80,7 +91,50 @@ export interface SessionContext {
 
 export interface LinearCallResult {
   ok: boolean;
+  status?: number;
+  error?: string;
   data?: Record<string, unknown>;
+}
+
+export type TriggerKind =
+  | "AgentSessionEvent"
+  | "Comment"
+  | "AppUserNotification"
+  | "Unknown";
+
+export type TriggerAction = "created" | "prompted";
+
+export interface Trigger {
+  kind: TriggerKind;
+  action: TriggerAction;
+  source: "session" | "comment" | "delegation";
+  payload: Record<string, unknown>;
+}
+
+export interface AddressabilityDecision {
+  ok: boolean;
+  reason: string;
+}
+
+export interface PreparedRun {
+  trigger: Trigger;
+  sessionId: string;
+  issueId: string;
+  issueIdentifier: string;
+  issueTitle: string;
+  issueUrl: string;
+  issueDescription: string;
+  teamId: string;
+  repo: string;
+  guidance: string;
+  prompt: string;
+  context: string;
+  compactMessage: boolean;
+  label: string;
+  agentId: string;
+  sessionKey: string;
+  idempotencyKey: string;
+  deliver: boolean;
 }
 
 export type ReadBodyResult =
@@ -93,4 +147,15 @@ export interface IssueInfo {
   stateType: string;
   delegateId: string;
   delegateName?: string;
+}
+
+export type AgentEventStream = "lifecycle" | "tool" | "assistant" | "error" | (string & {});
+
+export interface AgentEventPayload {
+  runId: string;
+  seq: number;
+  stream: AgentEventStream;
+  ts: number;
+  data: Record<string, unknown>;
+  sessionKey?: string;
 }

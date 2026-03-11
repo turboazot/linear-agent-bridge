@@ -87,6 +87,18 @@
       "mentionHandle": {
         "type": "string",
         "description": "App mention handle used for strict addressing (e.g. personal-openclaw)"
+      },
+      "agentTimeoutMs": {
+        "type": "number",
+        "description": "Max time to wait for one agent run before failing fast (default: 480000)"
+      },
+      "linearRequestTimeoutMs": {
+        "type": "number",
+        "description": "Timeout for each Linear GraphQL request (default: 15000)"
+      },
+      "heartbeatIntervalMs": {
+        "type": "number",
+        "description": "How often to post visible progress updates to Linear while the agent runs (default: 45000)"
       }
     }
   },
@@ -118,6 +130,18 @@
     "mentionHandle": {
       "label": "Mention handle",
       "placeholder": "personal-openclaw"
+    },
+    "agentTimeoutMs": {
+      "label": "Agent timeout (ms)",
+      "placeholder": "480000"
+    },
+    "linearRequestTimeoutMs": {
+      "label": "Linear request timeout (ms)",
+      "placeholder": "15000"
+    },
+    "heartbeatIntervalMs": {
+      "label": "Heartbeat interval (ms)",
+      "placeholder": "45000"
     }
   }
 }

@@ -12,6 +12,7 @@
   ],
   "scripts": {
     "build": "tsc",
+    "test": "npm run build && node --test dist/src/*.test.js dist/src/**/*.test.js",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
